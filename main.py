@@ -1,91 +1,149 @@
-# wildberries_rank_checker.py
 
-import asyncio
 import re
 import sys
 import argparse
+from time import sleep
 from urllib.parse import quote_plus
 
-from playwright.async_api import async_playwright
+import cloudscraper
+from bs4 import BeautifulSoup
+from requests.exceptions import HTTPError
 
-# Небольшой набор русских стоп-слов
 STOPWORDS = {
     "и", "в", "на", "с", "по", "из", "за", "к", "о", "от", "для",
     "что", "это", "как", "так", "его", "ее", "но", "или", "а",
 }
 
-async def extract_title_and_id(page, url):
-    await page.goto(url, wait_until="domcontentloaded")
-    # Ждем появления заголовка товара
-    h1 = await page.locator("h1").first
-    title = (await h1.inner_text()).strip()
-    # ID товара обычно содержится в URL как цифры
-    m = re.search(r"/(\d+)(?:/|$)", url)
-    product_id = m.group(1) if m else None
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Referer": "https://www.wildberries.ru/",
+}
+
+API_URL = "https://card.wb.ru/cards/detail"
+
+def extract_title_and_id(url, scraper):
+    """
+    Берёт артикул из URL, запрашивает JSON-API Wildberries
+    и возвращает реальное название товара и его ID.
+    """
+    m = re.search(r"/catalog/(\d+)(?:/|$)", url)
+    if not m:
+        print("❌ Не удалось извлечь артикул из URL.", file=sys.stderr)
+        sys.exit(1)
+    product_id = m.group(1)
+
+    params = {
+        "dest": "-1257786",  
+        "nm": product_id,
+    }
+    try:
+        resp = scraper.get(API_URL, params=params, timeout=10, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+    except HTTPError as e:
+        code = getattr(e.response, "status_code", "")
+        print(f"❌ HTTP {code} при запросе JSON-API товара: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Сетевая ошибка при запросе JSON-API товара: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 3) Извлекаем название из поля data.products[0].name
+    products = data.get("data", {}).get("products") or []
+    if not products:
+        print("❌ В ответе JSON-API не обнаружена информация о товаре.", file=sys.stderr)
+        sys.exit(1)
+
+    title = products[0].get("name", "").strip()
+    if not title:
+        print("❌ Пустое название в JSON-API.", file=sys.stderr)
+        sys.exit(1)
+
     return title, product_id
 
 def extract_keywords(title, max_keywords=5):
-    # Все русские слова
     words = re.findall(r"[А-Яа-яЁё]+", title)
     kws = []
     for w in words:
         w_low = w.lower()
         if len(w_low) > 3 and w_low not in STOPWORDS and w_low not in kws:
             kws.append(w_low)
-        if len(kws) >= max_keywords:
-            break
+            if len(kws) >= max_keywords:
+                break
     return kws
 
-async def find_position(playwright, query, product_id, max_pages=5):
-    browser = await playwright.chromium.launch()
-    page = await browser.new_page()
-    # Пробегаем страницы выдачи
+def find_position(query, product_id, scraper, max_pages=5):
+    """
+    Использует внутренний API поиска Wildberries и возвращает
+    (page, position, checked_count) если товар найден, иначе (None, None, checked_count).
+    checked_count — сколько всего товаров просмотрено.
+    """
+    SEARCH_API = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+    checked_count = 0
     for p in range(1, max_pages + 1):
-        url = f"https://www.wildberries.ru/catalog/0/search.aspx?search={quote_plus(query)}&page={p}"
-        await page.goto(url, wait_until="networkidle")
-        # Ищем карточки товаров, у них есть атрибут data-nm-id
-        cards = await page.locator("[data-nm-id]").all()
-        for idx, card in enumerate(cards, start=1):
-            nm = await card.get_attribute("data-nm-id")
-            if nm == product_id:
-                await browser.close()
-                return (p, idx)
-    await browser.close()
-    return (None, None)
+        params = {
+            "appType": "1",
+            "dest": "-1257786",
+            "curr": "rub",
+            "locale": "ru",
+            "lang": "ru",
+            "pricemarginCoeff": "1.0",
+            "query": query,
+            "page": p,
+            "spp": "0",
+            "resultset": "catalog",    # <- обязательно
+        }
+        try:
+            resp = scraper.get(SEARCH_API, params=params, headers=HEADERS, timeout=10)
+            # print(f"[DEBUG] {resp.url}")
+            # print(f"[DEBUG] {resp.text[:500]}")
+            resp.raise_for_status()
+            data = resp.json()
+        except HTTPError as e:
+            code = getattr(e.response, "status_code", "")
+            print(f"❌ HTTP {code} при запросе API поиска (страница {p}): {e}", file=sys.stderr)
+            return None, None, checked_count
+        except Exception as e:
+            print(f"❌ Сетевая ошибка при запросе API поиска (страница {p}): {e}", file=sys.stderr)
+            return None, None, checked_count
 
-async def main():
+        products = data.get("data", {}).get("products", [])
+        for idx, item in enumerate(products, start=1):
+            checked_count += 1
+            if str(item.get("id")) == product_id:
+                return p, idx, checked_count
+        checked_count += 0  # на случай пустого products
+
+    return None, None, checked_count
+
+def main():
     parser = argparse.ArgumentParser(
-        description="Проверка позиций Wildberries-товара по ключевым словам."
+        description="Проверка позиций Wildberries-товара (cloudscraper)."
     )
     parser.add_argument("url", help="Ссылка на страницу товара Wildberries")
-    parser.add_argument(
-        "--max-pages", type=int, default=3,
-        help="Сколько страниц выдачи сканировать (по умолчанию 3)"
-    )
+    parser.add_argument("-m", "--max-pages", type=int, default=3,
+                        help="Сколько страниц выдачи сканировать")
     args = parser.parse_args()
 
-    async with async_playwright() as pw:
-        title, product_id = await extract_title_and_id(pw, args.url)
-        if not product_id:
-            print("Не удалось определить ID товара из URL.", file=sys.stderr)
-            sys.exit(1)
+    scraper = cloudscraper.create_scraper()
+    title, product_id = extract_title_and_id(args.url, scraper)
+    print(f"Заголовок: {title}\nID: {product_id}\n")
 
-        print(f"Заголовок товара: {title}")
-        print(f"ID товара: {product_id}\n")
+    keywords = extract_keywords(title)
+    print("Ключевые слова:", ", ".join(keywords), "\n")
 
-        keywords = extract_keywords(title)
-        if not keywords:
-            print("Не удалось извлечь ключевые слова из заголовка.", file=sys.stderr)
-            sys.exit(1)
-
-        print("Ключевые слова для запросов:", ", ".join(keywords), "\n")
-
-        for kw in keywords:
-            page_num, pos = await find_position(pw, kw, product_id, args.max_pages)
-            if page_num:
-                print(f"Запрос «{kw}»: страница {page_num}, позиция {pos}")
-            else:
-                print(f"Запрос «{kw}»: товар не найден в первых {args.max_pages} страницах")
+    for kw in keywords:
+        page_num, pos, checked = find_position(kw, product_id, scraper, args.max_pages)
+        if page_num:
+            print(f"«{kw}»: страница {page_num}, позиция {pos} (проверено ссылок: {checked})")
+        else:
+            print(f"«{kw}»: не найдено в первых {args.max_pages} страницах (проверено ссылок: {checked})")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
