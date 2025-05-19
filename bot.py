@@ -10,7 +10,7 @@ from main import extract_title_and_id, extract_keywords, find_position
 import cloudscraper
 
 # Получаем токен из переменной окружения или вставьте свой токен ниже
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "1306442498:AAHLiv_8x__-Zqhxn3v_mko4JGTnl0mUfbc")
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "<ВАШ ТОКЕН>")
 
 bot = Bot(
     token=BOT_TOKEN,
